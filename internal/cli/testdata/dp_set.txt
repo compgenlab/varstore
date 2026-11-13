@@ -1,3 +1,0 @@
-# DP values of interest
-30
-25
