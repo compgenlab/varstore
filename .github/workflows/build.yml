@@ -1,0 +1,148 @@
+name: Build
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    # Fetch the cghts dependency straight from GitHub (not the public module
+    # proxy/sumdb), so a freshly pushed cghts tag is visible to this build
+    # immediately and "go get cghts@latest" resolves it without proxy-cache lag.
+    env:
+      GOPRIVATE: github.com/compgenlab/*
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # Remote/CI builds use the latest released cghts from GitHub. Local builds
+      # instead use the live sibling checkout via the go.work workspace.
+      #
+      # EXCEPT while go.mod pins an unreleased cghts. A feature spanning both
+      # repos is built against a cghts commit before it is tagged, and the pin is
+      # then a pseudo-version (v0.12.1-0.<date>-<sha>) or a pre-release -- either
+      # way it carries a "-", which a release tag never does. @latest skips those,
+      # so following it would build this branch against code that lacks what the
+      # branch needs. The pin is honoured instead, and named in the log. make
+      # release-check refuses such a pin, so it cannot reach a release.
+      - name: Resolve cghts
+        run: |
+          pin=$(GOCACHE=/tmp/go-build-cache go list -m -f '{{.Version}}' github.com/compgenlab/cghts)
+          case "$pin" in
+            *-*) echo "go.mod pins unreleased cghts $pin; building against the pin" ;;
+            *)   GOCACHE=/tmp/go-build-cache go get github.com/compgenlab/cghts@latest ;;
+          esac
+
+      - name: Run go vet
+        run: GOCACHE=/tmp/go-build-cache go vet ./...
+
+      - name: Run tests
+        run: GOCACHE=/tmp/go-build-cache go test ./...
+
+      - name: Set version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$(git describe --tags --always --dirty)" >> "$GITHUB_OUTPUT"
+          fi
+          echo "git_hash=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build binaries
+        env:
+          LDFLAGS: >-
+            -X 'github.com/compgenlab/varstore/internal/cli.Version=${{ steps.version.outputs.version }}'
+            -X 'github.com/compgenlab/varstore/internal/cli.GitHash=${{ steps.version.outputs.git_hash }}'
+        run: |
+          mkdir -p bin
+          GOOS=darwin  GOARCH=arm64                go build -buildvcs=false -ldflags "$LDFLAGS" -o bin/varstore.darwin_arm64 ./cmd/varstore
+          GOOS=darwin  GOARCH=amd64                go build -buildvcs=false -ldflags "$LDFLAGS" -o bin/varstore.darwin_amd64 ./cmd/varstore
+          GOOS=linux   GOARCH=arm64 CGO_ENABLED=0  go build -buildvcs=false -ldflags "$LDFLAGS" -o bin/varstore.linux_arm64 ./cmd/varstore
+          GOOS=linux   GOARCH=amd64 CGO_ENABLED=0  go build -buildvcs=false -ldflags "$LDFLAGS" -o bin/varstore.linux_amd64 ./cmd/varstore
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0  go build -buildvcs=false -ldflags "$LDFLAGS" -o bin/varstore.windows_amd64.exe ./cmd/varstore
+
+      - name: Upload varstore.darwin_arm64
+        uses: actions/upload-artifact@v7
+        with:
+          name: varstore.darwin_arm64
+          path: bin/varstore.darwin_arm64
+
+      - name: Upload varstore.darwin_amd64
+        uses: actions/upload-artifact@v7
+        with:
+          name: varstore.darwin_amd64
+          path: bin/varstore.darwin_amd64
+
+      - name: Upload varstore.linux_arm64
+        uses: actions/upload-artifact@v7
+        with:
+          name: varstore.linux_arm64
+          path: bin/varstore.linux_arm64
+
+      - name: Upload varstore.linux_amd64
+        uses: actions/upload-artifact@v7
+        with:
+          name: varstore.linux_amd64
+          path: bin/varstore.linux_amd64
+
+      - name: Upload varstore.windows_amd64
+        uses: actions/upload-artifact@v7
+        with:
+          name: varstore.windows_amd64.exe
+          path: bin/varstore.windows_amd64.exe
+
+      - name: Create source archive
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          mkdir -p dist
+          git archive --format=zip --prefix=varstore-${VERSION}/ HEAD > dist/varstore-${VERSION}-src.zip
+
+      - name: Create tagged release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            bin/varstore.darwin_arm64
+            bin/varstore.darwin_amd64
+            bin/varstore.linux_arm64
+            bin/varstore.linux_amd64
+            bin/varstore.windows_amd64.exe
+            dist/varstore-*-src.zip
+
+      - name: Create dev release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: dev
+          name: Development Build
+          prerelease: true
+          make_latest: false
+          body: |
+            Automated build from main branch.
+
+            **Commit:** ${{ github.sha }}
+            **Version:** ${{ steps.version.outputs.version }}
+          files: |
+            bin/varstore.darwin_arm64
+            bin/varstore.darwin_amd64
+            bin/varstore.linux_arm64
+            bin/varstore.linux_amd64
+            bin/varstore.windows_amd64.exe
+            dist/varstore-*-src.zip
