@@ -188,6 +188,16 @@ func summarizeMultiVolume(out io.Writer, s *varstore.VarStore, path string) erro
 		}
 		fmt.Fprintf(out, "  depth bands   %v (%s)\n", man.Params.DepthBands, how)
 	}
+	if man.Params.RefBlocks {
+		fmt.Fprintf(out, "  ref blocks    yes")
+		if man.Params.MaxGap > 0 {
+			fmt.Fprintf(out, ", merged across gaps up to %d bp", man.Params.MaxGap)
+		}
+		fmt.Fprintln(out)
+		writeArchiveRefBlockSamples(out, s, man)
+	} else {
+		fmt.Fprintf(out, "  ref blocks    no (answers only for variants in the catalog)\n")
+	}
 	if len(man.Params.Info) > 0 {
 		var names []string
 		for _, f := range man.Params.Info {
@@ -270,6 +280,8 @@ func summarizeStore(out *bufio.Writer, errOut interface{ Write([]byte) (int, err
 			fmt.Fprintf(out, ", merged across gaps up to %d bp", m.Params.MaxGap)
 		}
 		fmt.Fprintln(out)
+		attached, known := s.RefBlockSamples()
+		fmt.Fprintf(out, "           %s\n", refBlockCoverage(attached, known, samples))
 	} else {
 		fmt.Fprintf(out, "ref blocks no   (answers only for variants in the catalog)\n")
 	}
@@ -397,6 +409,8 @@ func writeSummaryJSON(out *bufio.Writer, store varstore.Store, path string) erro
 	switch s := store.(type) {
 	case *varstore.ParquetVolume:
 		return enc.Encode(s.VolumeManifest())
+	case *varstore.VarStore:
+		return enc.Encode(s.StoreManifest())
 	case *varstore.VcfStore:
 		samples, err := s.Samples()
 		if err != nil {
@@ -463,4 +477,62 @@ func describeUnreadableStore(ctx context.Context, path string, openErr error) (s
 	fmt.Fprintf(&b, "about how much of the input went into it -- that is what the manifest\n")
 	fmt.Fprintf(&b, "records, and why it is required. Re-convert with varstore convert --force.\n\n")
 	return b.String(), true
+}
+
+// refBlockCoverage says whose gVCFs a store's reference blocks came from.
+//
+// This is the line that separates "not covered" from "not attached". A roster
+// sample with no block at a position answers not_assayed either way, so a store
+// attached from 9,800 of 10,000 gVCFs reads like one attached from all of them
+// unless the summary says otherwise -- and the missing 200 are named, as far as
+// a line allows, because "which ones" is the next question.
+func refBlockCoverage(attached []string, known bool, roster []string) string {
+	if !known {
+		return "from samples not recorded (attached before the list was kept); " +
+			"rerun refblock-attach --rebuild to record them"
+	}
+	if len(attached) == len(roster) {
+		return fmt.Sprintf("from all %s samples", comma(int64(len(roster))))
+	}
+	in := make(map[string]bool, len(attached))
+	for _, a := range attached {
+		in[a] = true
+	}
+	var missing []string
+	for _, r := range roster {
+		if !in[r] {
+			missing = append(missing, r)
+		}
+	}
+	return fmt.Sprintf("from %s of %s samples; not attached%s",
+		comma(int64(len(attached))), comma(int64(len(roster))), firstFew(missing))
+}
+
+// writeArchiveRefBlockSamples states the attached samples once when the volumes
+// agree, and per volume when they do not. Volumes disagree after a replace that
+// died partway; averaging that away would hide exactly the state worth seeing.
+func writeArchiveRefBlockSamples(out io.Writer, s *varstore.VarStore, man *varstore.StoreManifest) {
+	if attached, ok := s.RefBlockSamples(); ok {
+		fmt.Fprintf(out, "                %s\n", refBlockCoverage(attached, true, man.Samples))
+		return
+	}
+	var differ bool
+	for _, v := range man.Volumes {
+		if v.RefBlockSamples != nil {
+			differ = true
+		}
+	}
+	if !differ {
+		fmt.Fprintf(out, "                %s\n", refBlockCoverage(nil, false, man.Samples))
+		return
+	}
+	fmt.Fprintf(out, "                attached samples differ by volume:\n")
+	for _, v := range man.Volumes {
+		var list []string
+		if v.RefBlockSamples != nil {
+			list = *v.RefBlockSamples
+		}
+		fmt.Fprintf(out, "                  %-16s %s\n", v.Name,
+			refBlockCoverage(list, v.RefBlockSamples != nil, man.Samples))
+	}
 }
