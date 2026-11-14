@@ -146,3 +146,60 @@ func TestVarsummaryReportsAttachedRefBlocks(t *testing.T) {
 		}
 	}
 }
+
+// A sample whose gVCF was never attached answers not_assayed off the catalog
+// exactly as one whose gVCF reported nothing there, so summary has to say which
+// samples' fragments are in the table -- or a store attached from 9,800 of
+// 10,000 gVCFs reads like one attached from all of them. compgenlab/varstore#3.
+func TestVarsummaryNamesSamplesWithoutRefBlocks(t *testing.T) {
+	roster, s1 := refBlocksFixture(t, "S1")
+	frag := filepath.Join(t.TempDir(), "S1")
+	runVcf(t, "refblock-calc", "--roster", roster, "--out", frag, s1)
+	runVcf(t, "refblock-attach", roster, frag)
+
+	out := runVcf(t, "summary", roster)
+	if !strings.Contains(out, "from 1 of 2 samples; not attached: S2") {
+		t.Errorf("summary does not say S2 was never attached:\n%s", out)
+	}
+	js := runVcf(t, "summary", "--format", "json", roster)
+	if !strings.Contains(js, `"ref_block_samples": [`) || !strings.Contains(js, `"S1"`) {
+		t.Errorf("summary --format json does not carry the attached samples:\n%s", js)
+	}
+
+	// Attaching S2 as well makes it everyone.
+	_, s2 := refBlocksFixture(t, "S2")
+	frag2 := filepath.Join(t.TempDir(), "S2")
+	runVcf(t, "refblock-calc", "--roster", roster, "--out", frag2, s2)
+	runVcf(t, "refblock-attach", "--replace", "S2", roster, frag2)
+	if out := runVcf(t, "summary", roster); !strings.Contains(out, "from all 2 samples") {
+		t.Errorf("after attaching S2 too:\n%s", out)
+	}
+}
+
+// On an archive the list is stated once, for the store, since an attach run
+// gives every volume the same one.
+func TestVarsummaryNamesSamplesWithoutRefBlocksOnAnArchive(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "cohort")
+	runVcf(t, "convert", "--out", filepath.Join(base, "chr1"), "testdata/multi_chr1.vcf")
+	runVcf(t, "convert", "--out", filepath.Join(base, "chr2"), "testdata/multi_chr2.vcf")
+	runVcf(t, "create", base)
+
+	_, s1 := refBlocksFixture(t, "S1")
+	frag := filepath.Join(t.TempDir(), "S1")
+	runVcf(t, "refblock-calc", "--roster", base, "--out", frag, s1)
+	runVcf(t, "refblock-attach", base, frag)
+
+	out := runVcf(t, "summary", base)
+	for _, want := range []string{"ref blocks    yes", "from 1 of 2 samples; not attached: S2"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("archive summary is missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "differ by volume") {
+		t.Errorf("one attach run reported volumes that disagree:\n%s", out)
+	}
+	js := runVcf(t, "summary", "--format", "json", base)
+	if !strings.Contains(js, `"ref_block_samples": [`) || !strings.Contains(js, `"volumes"`) {
+		t.Errorf("archive --format json is not the store manifest with the list:\n%s", js)
+	}
+}
